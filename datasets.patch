@@ -1,0 +1,27 @@
+diff --git a/src/datasets/packaged_modules/webdataset/webdataset.py b/src/datasets/packaged_modules/webdataset/webdataset.py
+index fc1567d4a..c2ce283e5 100644
+--- a/src/datasets/packaged_modules/webdataset/webdataset.py
++++ b/src/datasets/packaged_modules/webdataset/webdataset.py
+@@ -111,9 +111,20 @@ class WebDataset(datasets.GeneratorBasedBuilder):
+         ]
+         for tar_idx, (tar_path, tar_iterator) in enumerate(zip(tar_paths, tar_iterators)):
+             for example_idx, example in enumerate(self._get_pipeline_from_tar(tar_path, tar_iterator)):
++                skip = False
+                 for field_name in image_field_names + audio_field_names:
+-                    example[field_name] = {"path": example["__key__"] + "." + field_name, "bytes": example[field_name]}
+-                yield f"{tar_idx}_{example_idx}", example
++                    if field_name == "image":
++                        supported_image_extenstions = { "jpg", "gif", "png" }
++                        file_ext = set(example.keys()).intersection(supported_image_extenstions)
++                        if len(file_ext) != 1:
++                            skip = True
++                            break
++                        file_ext = file_ext.pop()
++                        example[field_name] = {"path": example["__key__"] + "." + file_ext, "bytes": example[file_ext]}
++                    else:
++                        example[field_name] = {"path": example["__key__"] + "." + field_name, "bytes": example[field_name]}
++                if not skip:
++                    yield f"{tar_idx}_{example_idx}", example
+ 
+ 
+ # Obtained with:
