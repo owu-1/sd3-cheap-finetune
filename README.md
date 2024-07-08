@@ -39,6 +39,8 @@ The following steps setup the instance for finetuning:
 - SSH into the instance
 - Setup the NVMe disk ```sudo bash nvme.sh```
 - Setup pytorch environment ```bash setup_image_gen.sh```
+- Exit SSH and SSH back in again (so you can load into the conda env)
+- ```conda activate build```
 - Apply datasets.patch to ```!conda-site-packages-datasets-dir!/packaged_modules/webdataset/webdataset.py``` e.g. ```patch /mnt/resource_nvme/miniconda3/envs/build/lib/python3.11/site-packages/datasets/packaged_modules/webdataset/webdataset.py < datasets.patch```
 
 Ensure accelerate config exists and uses mixed precision ```accelerate config```
