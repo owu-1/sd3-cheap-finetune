@@ -41,6 +41,7 @@ The following steps setup the instance for finetuning:
 - Setup pytorch environment ```bash setup_image_gen.sh```
 - Apply datasets.patch to ```!conda-site-packages-datasets-dir!/packaged_modules/webdataset/webdataset.py``` e.g. ```patch /mnt/resource_nvme/miniconda3/envs/build/lib/python3.11/site-packages/datasets/packaged_modules/webdataset/webdataset.py < datasets.patch```
 
+Ensure accelerate config exists and uses mixed precision ```accelerate config```
 Run custom_train.py to start finetuning ```accelerate launch custom_train.py```
 
 To take down the instance, comment out all lines in a100.tf and run ```tofu apply```
