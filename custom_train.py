@@ -2,14 +2,14 @@
 
 from pathlib import Path
 from accelerate import Accelerator
-from accelerate.utils import DistributedDataParallelKwargs, ProjectConfiguration, set_seed
+from accelerate.utils import ProjectConfiguration, set_seed
 import logging
 from accelerate.logging import get_logger
 import transformers
 import diffusers
 import os
-from diffusers import StableDiffusion3Pipeline, SD3Transformer2DModel
-from transformers import CLIPTextModelWithProjection, T5EncoderModel
+from diffusers import StableDiffusion3Pipeline, SD3Transformer2DModel, AutoencoderKL, FlowMatchEulerDiscreteScheduler
+from transformers import CLIPTextModelWithProjection, T5EncoderModel, CLIPTokenizer, T5TokenizerFast
 from diffusers.utils.torch_utils import is_compiled_module
 import bitsandbytes as bnb
 from torch.utils.data import IterableDataset, DataLoader
@@ -19,7 +19,6 @@ from PIL import Image
 from torchvision import transforms
 from PIL.ImageOps import exif_transpose
 import torch
-from diffusers import FlowMatchEulerDiscreteScheduler
 from io import BytesIO
 import numpy as np
 from tqdm.auto import tqdm
@@ -221,18 +220,23 @@ class E621Dataset(IterableDataset):
 
             bucket_id = self._assign_bucket(image.size)
             bucket = buckets[bucket_id]
-            bucket.append((post_data, image))
+
+            # Puts tags into their categories on the fly
+            tag_categories = self._tag_string_to_categories(post_data["tag_string"][0])
+            post_data.update(tag_categories)
+            
+            bucket.append({
+                "post_data": post_data,
+                "image": image
+            })
 
             if len(bucket) == self.bucket_size:
                 # Return and empty bucket
                 buckets[bucket_id] = list()
 
+                # Must yield buckets, not individual items otherwise there is a race condition if dataloader num_workers > 1
                 bucket_resolution = self.bucket_resolutions[bucket_id]
-                for post_data, image in bucket:
-                    # Puts tags into their categories on the fly
-                    tag_categories = self._tag_string_to_categories(post_data["tag_string"][0])
-                    post_data.update(tag_categories)
-                    yield { "post_data": post_data, "image": image, "bucket_resolution": bucket_resolution }
+                yield { "bucket": bucket, "bucket_resolution": bucket_resolution }
 
 
     def __iter__(self):
@@ -305,23 +309,12 @@ def load_model_hook(models, input_dir, unwrap_model):
 
 def _encode_prompt_with_clip(
     text_encoder,
-    tokenizer,
-    prompt: str,
+    text_input_ids,
     device=None,
     num_images_per_prompt: int = 1,
 ):
-    prompt = [prompt] if isinstance(prompt, str) else prompt
-    batch_size = len(prompt)
+    batch_size, token_len = text_input_ids.shape
 
-    text_inputs = tokenizer(
-        prompt,
-        padding="max_length",
-        max_length=77,
-        truncation=True,
-        return_tensors="pt",
-    )
-
-    text_input_ids = text_inputs.input_ids
     prompt_embeds = text_encoder(text_input_ids.to(device), output_hidden_states=True)
 
     pooled_prompt_embeds = prompt_embeds[0]
@@ -338,24 +331,12 @@ def _encode_prompt_with_clip(
 
 def _encode_prompt_with_t5(
     text_encoder,
-    tokenizer,
-    max_sequence_length,
-    prompt=None,
+    text_input_ids,
     num_images_per_prompt=1,
     device=None,
 ):
-    prompt = [prompt] if isinstance(prompt, str) else prompt
-    batch_size = len(prompt)
+    batch_size, token_len = text_input_ids.shape
 
-    text_inputs = tokenizer(
-        prompt,
-        padding="max_length",
-        max_length=max_sequence_length,
-        truncation=True,
-        add_special_tokens=True,
-        return_tensors="pt",
-    )
-    text_input_ids = text_inputs.input_ids
     prompt_embeds = text_encoder(text_input_ids.to(device))[0]
 
     dtype = text_encoder.dtype
@@ -371,41 +352,45 @@ def _encode_prompt_with_t5(
 
 
 def encode_prompt(
-    text_encoders,
-    tokenizers,
-    prompt: str,
-    max_sequence_length,
+    text_encoder,
+    text_encoder_2,
+    text_encoder_3,
+    text_input_ids,
     device=None,
     num_images_per_prompt: int = 1,
 ):
-    prompt = [prompt] if isinstance(prompt, str) else prompt
-
-    clip_tokenizers = tokenizers[:2]
-    clip_text_encoders = text_encoders[:2]
-
     clip_prompt_embeds_list = []
     clip_pooled_prompt_embeds_list = []
-    for tokenizer, text_encoder in zip(clip_tokenizers, clip_text_encoders):
-        prompt_embeds, pooled_prompt_embeds = _encode_prompt_with_clip(
-            text_encoder=text_encoder,
-            tokenizer=tokenizer,
-            prompt=prompt,
-            device=device if device is not None else text_encoder.device,
-            num_images_per_prompt=num_images_per_prompt,
-        )
-        clip_prompt_embeds_list.append(prompt_embeds)
-        clip_pooled_prompt_embeds_list.append(pooled_prompt_embeds)
+
+    # Text encoder 1
+    prompt_embeds, pooled_prompt_embeds = _encode_prompt_with_clip(
+        text_encoder=text_encoder,
+        text_input_ids=text_input_ids[0],
+        device=device if device is not None else text_encoder.device,
+        num_images_per_prompt=num_images_per_prompt,
+    )
+    clip_prompt_embeds_list.append(prompt_embeds)
+    clip_pooled_prompt_embeds_list.append(pooled_prompt_embeds)
+
+    # Text encoder 2
+    prompt_embeds, pooled_prompt_embeds = _encode_prompt_with_clip(
+        text_encoder=text_encoder_2,
+        text_input_ids=text_input_ids[1],
+        device=device if device is not None else text_encoder_2.device,
+        num_images_per_prompt=num_images_per_prompt,
+    )
+    clip_prompt_embeds_list.append(prompt_embeds)
+    clip_pooled_prompt_embeds_list.append(pooled_prompt_embeds)
 
     clip_prompt_embeds = torch.cat(clip_prompt_embeds_list, dim=-1)
     pooled_prompt_embeds = torch.cat(clip_pooled_prompt_embeds_list, dim=-1)
 
+    # Text encoder 3
     t5_prompt_embed = _encode_prompt_with_t5(
-        text_encoders[-1],
-        tokenizers[-1],
-        max_sequence_length,
-        prompt=prompt,
+        text_encoder=text_encoder_3,
+        text_input_ids=text_input_ids[2],
         num_images_per_prompt=num_images_per_prompt,
-        device=device if device is not None else text_encoders[-1].device,
+        device=device if device is not None else text_encoder_3.device,
     )
 
     clip_prompt_embeds = torch.nn.functional.pad(
@@ -424,13 +409,11 @@ def _unwrap_model(model, accelerator):
 
 def setup_accelerator(output_dir, logging_dir, seed, gradient_accumulation_steps):
     accelerator_project_config = ProjectConfiguration(project_dir=output_dir, logging_dir=logging_dir)
-    kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
     accelerator = Accelerator(
         gradient_accumulation_steps=gradient_accumulation_steps,
         log_with="wandb",
         project_config=accelerator_project_config,
-        kwargs_handlers=[kwargs],
-        split_batches=True  # https://github.com/huggingface/transformers/issues/26548#issuecomment-1885798533
+        split_batches=True  # Dataloader takes a bucket, then the bucket is split between GPUs
     )
 
     set_seed(seed)
@@ -463,22 +446,64 @@ def setup_logging(accelerator):
 
 
 def load_model(model_name, weight_dtype):
-    pipeline = StableDiffusion3Pipeline.from_pretrained(model_name, torch_dtype=weight_dtype)
+    transformer = SD3Transformer2DModel.from_pretrained(
+        model_name,
+        subfolder="transformer",
+        torch_dtype=weight_dtype
+    )
 
-    pipeline.set_progress_bar_config(disable=True)
-
-    pipeline.transformer.requires_grad_(True)
-    pipeline.vae.requires_grad_(False)
-    pipeline.text_encoder.requires_grad_(False)
-    pipeline.text_encoder_2.requires_grad_(False)
-    pipeline.text_encoder_3.requires_grad_(False)
+    vae = AutoencoderKL.from_pretrained(
+        model_name,
+        subfolder="vae",
+        torch_dtype=weight_dtype
+    )
 
     noise_scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(
         model_name, subfolder="scheduler"
     )
-    noise_scheduler_copy = copy.deepcopy(noise_scheduler)  # Idk why the dreambooth script does this
 
-    return pipeline, noise_scheduler_copy
+    noise_scheduler = copy.deepcopy(noise_scheduler)  # https://github.com/huggingface/diffusers/issues/1606#issuecomment-1346667389
+
+    text_encoder = CLIPTextModelWithProjection.from_pretrained(
+        model_name,
+        subfolder="text_encoder",
+        torch_dtype=weight_dtype
+    )
+
+    text_encoder_2 = CLIPTextModelWithProjection.from_pretrained(
+        model_name,
+        subfolder="text_encoder_2",
+        torch_dtype=weight_dtype
+    )
+
+    text_encoder_3 = T5EncoderModel.from_pretrained(
+        model_name,
+        subfolder="text_encoder_3",
+        torch_dtype=weight_dtype
+    )
+
+    tokenizer = CLIPTokenizer.from_pretrained(
+        model_name,
+        subfolder="tokenizer"
+    )
+
+    tokenizer_2 = CLIPTokenizer.from_pretrained(
+        model_name,
+        subfolder="tokenizer_2"
+    )
+
+    tokenizer_3 = T5TokenizerFast.from_pretrained(
+        model_name,
+        subfolder="tokenizer_3"
+    )
+
+    transformer.requires_grad_(True)
+    vae.requires_grad_(False)
+    text_encoder.requires_grad_(False)
+    text_encoder_2.requires_grad_(False)
+    text_encoder_3.requires_grad_(False)
+
+    return transformer, vae, noise_scheduler, text_encoder, text_encoder_2, text_encoder_3, tokenizer, tokenizer_2, tokenizer_3
 
 
 # Modified from https://gist.github.com/Mikubill/5c9d62c28c1f2d81d82a2ed8b272540c#file-train_dreambooth-py-L1376-L1413
@@ -534,15 +559,65 @@ def image_preprocess(image, bucket_resolution):
 
     return image
 
+def prompt_create(post_data):
+    prompt = []
+    
+    prompt.extend(post_data["species_tags"])
+    prompt.extend(post_data["artist_tags"])
+    prompt.extend(post_data["general_tags"])
+    # Anything after general_tags will probably be truncated
 
-def collate_fn(batch, vae):
-    pixel_values = [image_preprocess(post["image"], post["bucket_resolution"]) for post in batch]
+    prompt = ", ".join(prompt)
+
+    return prompt
+
+
+def tokenize_prompts(prompts, tokenizer, tokenizer_2, tokenizer_3):
+    text_input_ids = tokenizer(
+        prompts,
+        padding="max_length",
+        max_length=77,
+        truncation=True,
+        return_tensors="pt",
+    )
+
+    text_input_ids_2 = tokenizer_2(
+        prompts,
+        padding="max_length",
+        max_length=77,
+        truncation=True,
+        return_tensors="pt",
+    )
+
+    text_input_ids_3 = tokenizer_3(
+        prompts,
+        padding="max_length",
+        max_length=77,
+        truncation=True,
+        add_special_tokens=True,
+        return_tensors="pt",
+    )
+
+    return [text_input_ids.input_ids, text_input_ids_2.input_ids, text_input_ids_3.input_ids]
+
+
+def collate_fn(batch, vae, tokenizer, tokenizer_2, tokenizer_3):
+    batch = batch[0]  # Unwrap
+
+    pixel_values = [image_preprocess(post["image"], batch["bucket_resolution"]) for post in batch["bucket"]]
     pixel_values = torch.stack(pixel_values)
     pixel_values = pixel_values.to(dtype=vae.dtype)
+    pixel_values = pixel_values.contiguous()  # using split_batches and multi-gpu requires tensor to be contiguous
 
-    prompts = [" ".join(post["post_data"]["general_tags"]) for post in batch]
+    prompts = [prompt_create(post["post_data"]) for post in batch["bucket"]]
+    text_input_ids = tokenize_prompts(prompts, tokenizer, tokenizer_2, tokenizer_3)
+    text_input_ids = torch.stack(text_input_ids)
+    # Batch size must be the first dimension for multi-gpu training
+    # Otherwise, only one gpu will receive the tensors and the others will receive empty tensors for some reason
+    text_input_ids = text_input_ids.permute(1, 0, 2)
+    text_input_ids = text_input_ids.contiguous()  # using split_batches and multi-gpu requires tensor to be contiguous
 
-    return { "pixel_values": pixel_values, "prompts": prompts }
+    return { "pixel_values": pixel_values, "text_input_ids": text_input_ids }
 
 
 def main():
@@ -550,7 +625,7 @@ def main():
     logging_dir = Path(output_dir, "logs")
     model_name = "stabilityai/stable-diffusion-3-medium-diffusers"
     learning_rate = 1e-06
-    batch_size = 5
+    batch_size = 8
     first_epoch = 0
     num_train_epochs = 1
     seed = 10
@@ -558,9 +633,7 @@ def main():
     num_proc = 16
     gradient_accumulation_steps = 1
     weighting_scheme = "logit_normal"
-    validation_prompt = "a furry"
-    validation_steps = 5
-    num_validation_images = 4
+    validation_steps = 200
 
     accelerator = setup_accelerator(output_dir, logging_dir, seed, gradient_accumulation_steps)
     setup_logging(accelerator)
@@ -577,11 +650,12 @@ def main():
     else:
         raise Exception(f"{accelerator.mixed_precision} not supported")
     
-    pipeline, noise_scheduler_copy = load_model(model_name, weight_dtype)
+    with accelerator.main_process_first():
+        transformer, vae, noise_scheduler, text_encoder, text_encoder_2, text_encoder_3, tokenizer, tokenizer_2, tokenizer_3 = load_model(model_name, weight_dtype)
 
     params = [
         {
-            "params": pipeline.transformer.parameters(),
+            "params": transformer.parameters(),
             "lr": learning_rate
         }
     ]
@@ -591,16 +665,19 @@ def main():
     dataset = E621Dataset("2024-07-06", accelerator, num_proc, seed, dataset_buffer_size, batch_size, gradient_accumulation_steps)
     dataloader = DataLoader(
         dataset,
-        batch_size=batch_size,
-        collate_fn=lambda batch : collate_fn(batch, pipeline.vae),
+        batch_size=1,  # Dataset yields a bucket for each iteration
+        collate_fn=lambda batch : collate_fn(batch, vae, tokenizer, tokenizer_2, tokenizer_3),
         # Run collate_fun in thread
         # Note that cuda operations cannot be run on a thread
-        num_workers=1,
-        # pin_memory=True
+        num_workers=4,  # For me, 4 workers is enough to feed 2 A100s at batch size 8 without compiling models
+        prefetch_factor=50,  # An arbitrary high number. Too high may run into RAM OOM
+        pin_memory=True
     )
 
+    dataloader_len = int(len(dataloader) / batch_size) * accelerator.num_processes  # assume dataloader batch_size is 1 (for avoiding race condition)
+
     # Scheduler and math around the number of training steps.
-    num_update_steps_per_epoch = math.ceil(len(dataloader) / gradient_accumulation_steps)
+    num_update_steps_per_epoch = math.ceil(dataloader_len / gradient_accumulation_steps)
     max_train_steps = num_train_epochs * num_update_steps_per_epoch
 
     lr_scheduler = get_scheduler(
@@ -611,27 +688,27 @@ def main():
     )
 
     (
-        pipeline.transformer,
-        pipeline.vae,
-        pipeline.text_encoder,
-        pipeline.text_encoder_2,
-        pipeline.text_encoder_3,
+        transformer,
+        vae,
+        text_encoder,
+        text_encoder_2,
+        text_encoder_3,
         optimizer,
         dataloader,
-        lr_scheduler
+        lr_scheduler,
     ) = accelerator.prepare(
-        pipeline.transformer,
-        pipeline.vae,
-        pipeline.text_encoder,
-        pipeline.text_encoder_2,
-        pipeline.text_encoder_3,
+        transformer,
+        vae,
+        text_encoder,
+        text_encoder_2,
+        text_encoder_3,
         optimizer,
         dataloader,
         lr_scheduler
     )
 
     # We need to recalculate our total training steps as the size of the training dataloader may have changed.
-    num_update_steps_per_epoch = math.ceil(len(dataloader) / gradient_accumulation_steps)
+    num_update_steps_per_epoch = math.ceil(dataloader_len / gradient_accumulation_steps)
     max_train_steps = num_train_epochs * num_update_steps_per_epoch
     # Afterwards we recalculate our number of training epochs
     num_train_epochs = math.ceil(max_train_steps / num_update_steps_per_epoch)
@@ -647,7 +724,7 @@ def main():
 
     logger.info("***** Running training *****")
     logger.info(f"  Num examples = {len(dataset)}")
-    logger.info(f"  Num batches each epoch = {len(dataloader)}")
+    logger.info(f"  Num batches each epoch = {dataloader_len}")
     logger.info(f"  Num Epochs = {num_train_epochs}")
     logger.info(f"  Instantaneous batch size per device = {batch_size}")
     logger.info(f"  Total train batch size (w. parallel, distributed & accumulation) = {total_batch_size}")
@@ -663,23 +740,37 @@ def main():
         disable=not accelerator.is_local_main_process,
     )
 
-    for epoch in range(first_epoch, num_train_epochs):
-        pipeline.transformer.train()
-        dataset.set_epoch(epoch)
-        get_logger(__name__).info(f"Starting epoch {epoch}", main_process_only=False)
-        for step, batch in enumerate(dataloader):
-            with accelerator.accumulate([pipeline.transformer]):
-                prompts = batch["prompts"]
-                prompt_embeds, pooled_prompt_embeds = encode_prompt(
-                    [pipeline.text_encoder, pipeline.text_encoder_2, pipeline.text_encoder_3],
-                    [pipeline.tokenizer, pipeline.tokenizer_2, pipeline.tokenizer_3],
-                    prompts,
-                    max_sequence_length=77
-                )
-                # might need to move above to accelerator device
+    inference_pipeline = StableDiffusion3Pipeline.from_pretrained(
+        model_name,
+        transformer=accelerator.unwrap_model(transformer),
+        # Original script doesn't pass noise_scheduler
+        vae=accelerator.unwrap_model(vae),
+        text_encoder=accelerator.unwrap_model(text_encoder),
+        text_encoder_2=accelerator.unwrap_model(text_encoder_2),
+        text_encoder_3=accelerator.unwrap_model(text_encoder_3),
+        tokenizer=tokenizer,
+        tokenizer_2=tokenizer_2,
+        tokenizer_3=tokenizer_3
+    )
 
-                latents = pipeline.vae.encode(batch["pixel_values"]).latent_dist.sample()
-                latents = latents * pipeline.vae.config.scaling_factor
+    for epoch in range(first_epoch, num_train_epochs):
+        transformer.train()
+        dataset.set_epoch(epoch)
+        logger.info(f"Starting epoch {epoch}", main_process_only=False)
+        for step, batch in enumerate(dataloader):
+            with accelerator.accumulate([transformer]):
+                text_input_ids = batch["text_input_ids"]
+                text_input_ids = text_input_ids.permute(1, 0, 2)  # reverse dimension switch
+
+                prompt_embeds, pooled_prompt_embeds = encode_prompt(
+                    text_encoder=text_encoder,
+                    text_encoder_2=text_encoder_2,
+                    text_encoder_3=text_encoder_3,
+                    text_input_ids=text_input_ids
+                )
+
+                latents = vae.encode(batch["pixel_values"]).latent_dist.sample()
+                latents = latents * vae.config.scaling_factor
 
                 # Sample noise that we'll add to the latents
                 noise = torch.randn_like(latents)
@@ -694,15 +785,15 @@ def main():
                     logit_std=1,
                     mode_scale=1.29,
                 )
-                indices = (u * noise_scheduler_copy.config.num_train_timesteps).long()
-                timesteps = noise_scheduler_copy.timesteps[indices].to(device=latents.device)
+                indices = (u * noise_scheduler.config.num_train_timesteps).long()
+                timesteps = noise_scheduler.timesteps[indices].to(device=latents.device)
 
                 # Add noise according to flow matching.
-                sigmas = get_sigmas(accelerator, noise_scheduler_copy, timesteps, n_dim=latents.ndim, dtype=latents.dtype)
+                sigmas = get_sigmas(accelerator, noise_scheduler, timesteps, n_dim=latents.ndim, dtype=latents.dtype)
                 noisy_model_input = sigmas * noise + (1.0 - sigmas) * latents
 
                 # Predict the noise residual
-                model_pred = pipeline.transformer(
+                model_pred = transformer(
                     hidden_states=noisy_model_input,
                     timestep=timesteps,
                     encoder_hidden_states=prompt_embeds,
@@ -730,7 +821,7 @@ def main():
                 accelerator.backward(loss)
                 if accelerator.sync_gradients:
                     params_to_clip = itertools.chain(
-                        pipeline.transformer.parameters()
+                        transformer.parameters()
                     )
                     accelerator.clip_grad_norm_(params_to_clip, max_norm=1)
 
@@ -745,43 +836,46 @@ def main():
 
                 if accelerator.is_main_process:
                     if global_step % validation_steps == 0:
-                        logger.info(
-                            f"Running validation... \n Generating {num_validation_images} images with prompt:"
-                            f" {validation_prompt}."
-                        )
+                        logger.info("Running validation...")
 
                         generator = torch.Generator(device=accelerator.device).manual_seed(seed)
 
-                        # Cannot run inference here because of type issues,
-                        # may need to init models manually and set their precision
-                        inference_pipeline = StableDiffusion3Pipeline.from_pretrained(
-                            model_name,
-                            # vae=accelerator.unwrap_model(pipeline.vae),
-                            text_encoder=accelerator.unwrap_model(pipeline.text_encoder),
-                            text_encoder_2=accelerator.unwrap_model(pipeline.text_encoder_2),
-                            text_encoder_3=accelerator.unwrap_model(pipeline.text_encoder_3),
-                            transformer=accelerator.unwrap_model(pipeline.transformer),
-                            torch_dtype=weight_dtype
-                        )
-                        inference_pipeline = inference_pipeline.to(accelerator.device)
+                        autocast_ctx = torch.autocast(accelerator.device.type)
+                        with autocast_ctx:
+                            def run_inference(prompt):
+                                image = inference_pipeline(prompt=prompt, generator=generator).images[0]
+                                image = wandb.Image(image, caption=prompt)
+                                return image
+                            
+                            prompts = [
+                                # Edited SeaArt example prompt
+                                "canid, canine, fox, mammal, red_fox, true_fox, foxgirl83, photonoko, day, digitigrade, fluffy, fluffy_tail, fur, orange_body, orange_fur, orange_tail, solo, sunlight, tail, mid, 2018, digital_media_(artwork), hi_res",
+                                # A fox
+                                "canid, canine, fox, mammal, anthro, male, solo",
+                                "canid, canine, fox, mammal, anthro, female, solo",
+                                # Two foxes
+                                "canid, canine, fox, mammal, anthro, male, duo",
+                                "canid, canine, fox, mammal, anthro, female, duo"
+                                # A wolf
+                                "canid, canine, canis, mammal, wolf, anthro, male, solo"
+                                "canid, canine, canis, mammal, wolf, anthro, female, solo"
+                            ]
 
-                        images = [inference_pipeline(prompt=validation_prompt, generator=generator).images[0] for _ in range(num_validation_images)]
+                            images = [run_inference(prompt) for prompt in prompts]
                         
                         for tracker in accelerator.trackers:
                             if tracker.name == "wandb":
-                                tracker.log(
-                                    {
-                                        "test": [
-                                            wandb.Image(image, caption=f"{i}: {validation_prompt}") for i, image in enumerate(images)
-                                        ]
-                                    }
-                                )
+                                tracker.log({ "test": images })
+
+                        if accelerator.is_main_process:
+                            accelerator.unwrap_model(transformer).save_pretrained(f"/mnt/resource_nvme/transformer-{global_step}")
 
             logs = {"loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0]}
             progress_bar.set_postfix(**logs)
             accelerator.log(logs, step=global_step)
 
-    get_logger(__name__).info(f"End", main_process_only=False)
+    logger.info("End")
+    accelerator.end_training()
 
 
 if __name__ == "__main__":
