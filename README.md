@@ -47,3 +47,5 @@ Ensure accelerate config exists and uses mixed precision ```accelerate config```
 Run custom_train.py to start finetuning ```accelerate launch custom_train.py```
 
 To take down the instance, comment out all lines in a100.tf and run ```tofu apply```
+
+WARNING!! - num_workers > 1 gives duplicate data
